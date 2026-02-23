@@ -1,10 +1,10 @@
 import torch
 
-from pocketchat.model import AdapterReferenceMatcher
+from pocketchat.model import Matcher
 
 
 def test_matcher_returns_expected_shape_with_global_adapters_and_references() -> None:
-    matcher = AdapterReferenceMatcher()
+    matcher = Matcher()
     input_embeddings = torch.randn(2, 5, 4)  # [B, T, D]
     adapters = torch.randn(3, 4)  # [M, D]
     references = torch.randn(3, 4)  # [M, D]
@@ -17,7 +17,7 @@ def test_matcher_returns_expected_shape_with_global_adapters_and_references() ->
 
 
 def test_matcher_returns_expected_shape_with_batched_adapters_and_references() -> None:
-    matcher = AdapterReferenceMatcher()
+    matcher = Matcher()
     input_embeddings = torch.randn(2, 7, 6)  # [B, T, D]
     adapters = torch.randn(2, 4, 6)  # [B, M, D]
     references = torch.randn(2, 4, 6)  # [B, M, D]
@@ -28,7 +28,7 @@ def test_matcher_returns_expected_shape_with_batched_adapters_and_references() -
 
 
 def test_matcher_simple_numeric_case() -> None:
-    matcher = AdapterReferenceMatcher()
+    matcher = Matcher()
 
     # B=1, T=2, D=2
     input_embeddings = torch.tensor([[[1.0, 0.0], [0.0, 1.0]]])
@@ -46,7 +46,7 @@ def test_matcher_simple_numeric_case() -> None:
 
 
 def test_matcher_adapter_masks_dimension_with_different_reference() -> None:
-    matcher = AdapterReferenceMatcher()
+    matcher = Matcher()
 
     # B=1, T=2, D=3
     input_embeddings = torch.tensor(
@@ -74,7 +74,7 @@ def test_matcher_adapter_masks_dimension_with_different_reference() -> None:
 
 
 def test_matcher_validates_shapes() -> None:
-    matcher = AdapterReferenceMatcher()
+    matcher = Matcher()
     input_embeddings = torch.randn(2, 5, 4)
 
     invalid_cases = (

@@ -38,7 +38,65 @@ class Cortex(nn.Module):
         return self.char_embeddings(token_ids.long())
 
 
-class AdapterReferenceMatcher(nn.Module):
+class Decomposer(nn.Module):
+    """
+    Decompose each input embedding into K component embeddings.
+
+    Architecture:
+    1) RMSNorm on the last dimension D
+    2) Linear projection D -> (K * D)
+    3) GeLU activation
+    4) Residual add with the original embedding broadcast to K slots
+
+    Supported input ranks:
+    - [B, D] -> [B, K, D]
+    - [B, H, D] -> [B, H, K, D]
+    - [B, H, P, D] -> [B, H, P, K, D]
+    - and in general any [..., D] -> [..., K, D]
+    """
+
+    def __init__(
+        self,
+        embedding_dim: int,
+        num_components: int,
+        eps: float = DEFAULT_MATCHER_EPS,
+        bias: bool = True,
+    ) -> None:
+        super().__init__()
+        if embedding_dim <= 0:
+            raise ValueError(f"embedding_dim must be > 0, got {embedding_dim}.")
+        if num_components <= 0:
+            raise ValueError(f"num_components must be > 0, got {num_components}.")
+        if eps <= 0:
+            raise ValueError(f"eps must be > 0, got {eps}.")
+
+        self.embedding_dim = embedding_dim
+        self.num_components = num_components
+        self.eps = eps
+
+        self.rms_norm = nn.RMSNorm(embedding_dim, eps=eps)
+        self.proj = nn.Linear(embedding_dim, num_components * embedding_dim, bias=bias)
+        self.activation = nn.GELU()
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        if inputs.ndim < 2:
+            raise ValueError(f"inputs must have at least 2 dims [..., D], got shape={tuple(inputs.shape)}.")
+        if inputs.shape[-1] != self.embedding_dim:
+            raise ValueError(
+                f"Last dim mismatch: expected D={self.embedding_dim}, got D={inputs.shape[-1]}."
+            )
+        if not inputs.dtype.is_floating_point:
+            raise TypeError(f"inputs must be floating-point tensor, got dtype={inputs.dtype}.")
+
+        normalized = self.rms_norm(inputs)
+        deltas = self.activation(self.proj(normalized))
+        deltas = deltas.reshape(*inputs.shape[:-1], self.num_components, self.embedding_dim)
+
+        residual_base = inputs.unsqueeze(-2)
+        return residual_base + deltas
+
+
+class Matcher(nn.Module):
     """
     Apply adapter modulation to input embeddings and compare with references.
 
@@ -112,7 +170,7 @@ class AdapterReferenceMatcher(nn.Module):
         return similarities.transpose(1, 2).contiguous()
 
 
-class DifferentiableGlimpse1D(nn.Module):
+class Glimpse(nn.Module):
     """
     Differentiable 1D glimpse over character embeddings using linear interpolation.
 

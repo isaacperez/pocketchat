@@ -1,6 +1,6 @@
 import torch
 
-from pocketchat.model import DifferentiableGlimpse1D
+from pocketchat.model import Glimpse
 
 
 def _fraction_to_logit(fraction: float) -> float:
@@ -13,7 +13,7 @@ def _fraction_to_logit(fraction: float) -> float:
 
 def test_glimpse_matches_contiguous_slice_at_min_zoom() -> None:
     embeddings = torch.arange(9, dtype=torch.float32).unsqueeze(-1)  # [L, D=1]
-    glimpse = DifferentiableGlimpse1D(
+    glimpse = Glimpse(
         window_size=5,
         num_glimpses=1,
         init_center_fraction=0.5,
@@ -30,7 +30,7 @@ def test_glimpse_matches_contiguous_slice_at_min_zoom() -> None:
 
 def test_glimpse_linear_interpolation_non_integer_positions() -> None:
     embeddings = torch.tensor([[0.0], [10.0], [20.0], [30.0], [40.0]])  # L=5, D=1
-    glimpse = DifferentiableGlimpse1D(
+    glimpse = Glimpse(
         window_size=3,
         num_glimpses=1,
         init_center_fraction=0.625,  # c = 1 + 0.625*(3-1) = 2.25
@@ -46,7 +46,7 @@ def test_glimpse_linear_interpolation_non_integer_positions() -> None:
 
 def test_glimpse_clamps_to_borders_when_positions_go_outside_sequence() -> None:
     embeddings = torch.tensor([[0.0], [10.0], [20.0], [30.0], [40.0]])  # L=5, D=1
-    glimpse = DifferentiableGlimpse1D(
+    glimpse = Glimpse(
         window_size=3,
         num_glimpses=2,
         init_center_fraction=0.5,
@@ -68,7 +68,7 @@ def test_glimpse_clamps_to_borders_when_positions_go_outside_sequence() -> None:
 def test_glimpse_supports_batch_and_multiple_glimpses_with_lengths() -> None:
     embeddings = torch.randn(2, 6, 4)  # [B=2, L=6, D=4]
     lengths = torch.tensor([6, 4])  # second sequence has valid region [0..3]
-    glimpse = DifferentiableGlimpse1D(window_size=4, num_glimpses=3, learnable=False)
+    glimpse = Glimpse(window_size=4, num_glimpses=3, learnable=False)
 
     out, aux = glimpse(
         embeddings,
@@ -85,7 +85,7 @@ def test_glimpse_supports_batch_and_multiple_glimpses_with_lengths() -> None:
 
 
 def test_glimpse_backprop_reaches_center_and_zoom_logits() -> None:
-    glimpse = DifferentiableGlimpse1D(
+    glimpse = Glimpse(
         window_size=5,
         num_glimpses=1,
         init_center_fraction=0.35,
@@ -116,7 +116,7 @@ def test_glimpse_rescales_correctly_for_all_center_zoom_grid_values() -> None:
     zoom_grid = [z for _ in center_fractions for z in zoom_fractions]
     num_glimpses = len(center_grid)
 
-    glimpse = DifferentiableGlimpse1D(
+    glimpse = Glimpse(
         window_size=window_size,
         num_glimpses=num_glimpses,
         learnable=False,
@@ -166,7 +166,7 @@ def test_glimpse_rescales_center_zoom_grid_correctly_with_batched_lengths() -> N
     zoom_grid = [z for _ in center_fractions for z in zoom_fractions]
     num_glimpses = len(center_grid)
 
-    glimpse = DifferentiableGlimpse1D(
+    glimpse = Glimpse(
         window_size=window_size,
         num_glimpses=num_glimpses,
         learnable=False,
