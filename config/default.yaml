@@ -1,0 +1,15 @@
+seed: 42
+device: auto
+steps: 3000
+log_every: 100
+save_every: 500
+learning_rate: 0.0005
+weight_decay: 0.00001
+
+batch_size: 64
+seq_len: 128
+max_chars: 0
+vocab_size: 256
+
+num_references: 256
+embedding_dim: 32

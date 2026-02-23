@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pocketchat"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+  "torch",
+  "wandb",
+  "pyyaml",
+  "tqdm",
+  "numpy>=2.2.6",
+]
+
+[dependency-groups]
+dev = [
+  "pytest",
+  "ruff",
+  "mypy",
+  "ipykernel>=7.2.0",
+]
+
+[tool.ruff]
+line-length = 120
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
