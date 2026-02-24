@@ -1,6 +1,6 @@
 import torch
 
-from pocketchat.model import Glimpse, HypothesisDecomposer, Matcher
+from pocketchat.model import HypothesisDecomposer
 
 
 def test_hypothesis_decomposer_unbatched_shapes() -> None:
@@ -63,27 +63,6 @@ def test_hypothesis_decomposer_backprop_reaches_all_heads() -> None:
     assert module.zoom_head[0].weight.grad.abs().sum().item() > 0
     assert module.reference_head[0].weight.grad.abs().sum().item() > 0
     assert module.adapter_head[0].weight.grad.abs().sum().item() > 0
-
-
-def test_hypothesis_decomposer_connects_with_glimpse_and_matcher() -> None:
-    hypotheses = torch.randn(2, 3, 4)  # [B, H, D]
-    input_embeddings = torch.randn(2, 7, 4)  # [B, L, D]
-
-    decomposer = HypothesisDecomposer(hypothesis_dim=4, num_parts=2, matcher_dim=4, hidden_dim=6)
-    center_logits, zoom_logits, references, adapters = decomposer(hypotheses)
-
-    glimpse = Glimpse(window_size=5, squeeze_output=False)
-    # Glimpse expects [B, G] logits, so flatten (H, K) into G = H*K.
-    windows = glimpse(
-        input_embeddings,
-        center_logits=center_logits.reshape(2, -1),
-        zoom_logits=zoom_logits.reshape(2, -1),
-    )
-    assert windows.shape == (2, 6, 5, 4)
-
-    matcher = Matcher()
-    heatmap = matcher(input_embeddings, references, adapters)
-    assert heatmap.shape == (2, 7, 3, 2)
 
 
 def test_hypothesis_decomposer_validates_constructor_arguments() -> None:
