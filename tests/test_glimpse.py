@@ -13,15 +13,13 @@ def _fraction_to_logit(fraction: float) -> float:
 
 def test_glimpse_matches_contiguous_slice_at_min_zoom() -> None:
     embeddings = torch.arange(9, dtype=torch.float32).unsqueeze(-1)  # [L, D=1]
-    glimpse = Glimpse(
-        window_size=5,
-        num_glimpses=1,
-        init_center_fraction=0.5,
-        init_zoom_fraction=0.0,
-        learnable=False,
-    )
+    glimpse = Glimpse(window_size=5)
 
-    out = glimpse(embeddings, zoom_logits=torch.tensor(-20.0))  # [W, D]
+    out = glimpse(
+        embeddings,
+        center_logits=torch.tensor(0.0),  # center_fraction=0.5
+        zoom_logits=torch.tensor(-20.0),  # approx zoom_fraction=0
+    )  # [W, D]
 
     expected = embeddings[2:7]
     assert out.shape == (5, 1)
@@ -30,15 +28,13 @@ def test_glimpse_matches_contiguous_slice_at_min_zoom() -> None:
 
 def test_glimpse_linear_interpolation_non_integer_positions() -> None:
     embeddings = torch.tensor([[0.0], [10.0], [20.0], [30.0], [40.0]])  # L=5, D=1
-    glimpse = Glimpse(
-        window_size=3,
-        num_glimpses=1,
-        init_center_fraction=0.625,  # c = 1 + 0.625*(3-1) = 2.25
-        init_zoom_fraction=0.0,  # s = 1
-        learnable=False,
-    )
+    glimpse = Glimpse(window_size=3)
 
-    out = glimpse(embeddings, zoom_logits=torch.tensor(-20.0))  # positions: ~1.25, ~2.25, ~3.25
+    out = glimpse(
+        embeddings,
+        center_logits=torch.tensor(_fraction_to_logit(0.625)),  # c = 1 + 0.625*(3-1) = 2.25
+        zoom_logits=torch.tensor(-20.0),  # approx zoom_fraction=0, so s = 1
+    )  # positions: ~1.25, ~2.25, ~3.25
 
     expected = torch.tensor([[12.5], [22.5], [32.5]])
     assert torch.allclose(out, expected, atol=1e-5)
@@ -46,13 +42,7 @@ def test_glimpse_linear_interpolation_non_integer_positions() -> None:
 
 def test_glimpse_clamps_to_borders_when_positions_go_outside_sequence() -> None:
     embeddings = torch.tensor([[0.0], [10.0], [20.0], [30.0], [40.0]])  # L=5, D=1
-    glimpse = Glimpse(
-        window_size=3,
-        num_glimpses=2,
-        init_center_fraction=0.5,
-        init_zoom_fraction=0.0,
-        learnable=False,
-    )
+    glimpse = Glimpse(window_size=3)
 
     center_logits = torch.tensor([-20.0, 20.0])  # approx center_fraction=0 and 1
     zoom_logits = torch.tensor([20.0, 20.0])  # approx zoom_fraction=1 (max zoom)
@@ -68,7 +58,7 @@ def test_glimpse_clamps_to_borders_when_positions_go_outside_sequence() -> None:
 def test_glimpse_supports_batch_and_multiple_glimpses_with_lengths() -> None:
     embeddings = torch.randn(2, 6, 4)  # [B=2, L=6, D=4]
     lengths = torch.tensor([6, 4])  # second sequence has valid region [0..3]
-    glimpse = Glimpse(window_size=4, num_glimpses=3, learnable=False)
+    glimpse = Glimpse(window_size=4)
 
     out, aux = glimpse(
         embeddings,
@@ -85,24 +75,23 @@ def test_glimpse_supports_batch_and_multiple_glimpses_with_lengths() -> None:
 
 
 def test_glimpse_backprop_reaches_center_and_zoom_logits() -> None:
-    glimpse = Glimpse(
-        window_size=5,
-        num_glimpses=1,
-        init_center_fraction=0.35,
-        init_zoom_fraction=0.65,
-        learnable=True,
-        squeeze_output=False,
-    )
+    glimpse = Glimpse(window_size=5, squeeze_output=False)
     embeddings = torch.randn(2, 8, 3)
+    center_logits = torch.tensor(0.25, dtype=torch.float32, requires_grad=True)
+    zoom_logits = torch.tensor(-0.1, dtype=torch.float32, requires_grad=True)
 
-    out = glimpse(embeddings)  # [B, G, W, D]
+    out = glimpse(
+        embeddings,
+        center_logits=center_logits,
+        zoom_logits=zoom_logits,
+    )  # [B, G, W, D]
     loss = out.pow(2).mean()
     loss.backward()
 
-    assert glimpse.center_logits.grad is not None
-    assert glimpse.zoom_logits.grad is not None
-    assert glimpse.center_logits.grad.abs().sum().item() > 0
-    assert glimpse.zoom_logits.grad.abs().sum().item() > 0
+    assert center_logits.grad is not None
+    assert zoom_logits.grad is not None
+    assert center_logits.grad.abs().item() > 0
+    assert zoom_logits.grad.abs().item() > 0
 
 
 def test_glimpse_rescales_correctly_for_all_center_zoom_grid_values() -> None:
@@ -116,11 +105,7 @@ def test_glimpse_rescales_correctly_for_all_center_zoom_grid_values() -> None:
     zoom_grid = [z for _ in center_fractions for z in zoom_fractions]
     num_glimpses = len(center_grid)
 
-    glimpse = Glimpse(
-        window_size=window_size,
-        num_glimpses=num_glimpses,
-        learnable=False,
-    )
+    glimpse = Glimpse(window_size=window_size)
     center_logits = torch.tensor([_fraction_to_logit(c) for c in center_grid], dtype=torch.float32)
     zoom_logits = torch.tensor([_fraction_to_logit(z) for z in zoom_grid], dtype=torch.float32)
 
@@ -166,12 +151,7 @@ def test_glimpse_rescales_center_zoom_grid_correctly_with_batched_lengths() -> N
     zoom_grid = [z for _ in center_fractions for z in zoom_fractions]
     num_glimpses = len(center_grid)
 
-    glimpse = Glimpse(
-        window_size=window_size,
-        num_glimpses=num_glimpses,
-        learnable=False,
-        squeeze_output=False,
-    )
+    glimpse = Glimpse(window_size=window_size, squeeze_output=False)
     center_logits = torch.tensor([_fraction_to_logit(c) for c in center_grid], dtype=torch.float32)
     zoom_logits = torch.tensor([_fraction_to_logit(z) for z in zoom_grid], dtype=torch.float32)
 

@@ -1,3 +1,5 @@
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -38,62 +40,65 @@ class Cortex(nn.Module):
         return self.char_embeddings(token_ids.long())
 
 
-class Decomposer(nn.Module):
+class HypothesisGenerator(nn.Module):
     """
-    Decompose each input embedding into K component embeddings.
+    Generate H hypothesis embeddings from a hidden state tensor.
 
     Architecture:
-    1) RMSNorm on the last dimension D
-    2) Linear projection D -> (K * D)
-    3) GeLU activation
-    4) Residual add with the original embedding broadcast to K slots
+    - hidden_state -> RMSNorm -> linear_in -> GeLU -> linear_out
 
-    Supported input ranks:
-    - [B, D] -> [B, K, D]
-    - [B, H, D] -> [B, H, K, D]
-    - [B, H, P, D] -> [B, H, P, K, D]
-    - and in general any [..., D] -> [..., K, D]
+    Input:
+    - hidden_state: [..., hidden_state_dim]
+
+    Output:
+    - hypotheses: [..., num_hypotheses, hypothesis_dim]
     """
 
     def __init__(
         self,
-        embedding_dim: int,
-        num_components: int,
+        hidden_state_dim: int,
+        num_hypotheses: int,
+        hypothesis_dim: int | None = None,
         eps: float = DEFAULT_MATCHER_EPS,
         bias: bool = True,
     ) -> None:
         super().__init__()
-        if embedding_dim <= 0:
-            raise ValueError(f"embedding_dim must be > 0, got {embedding_dim}.")
-        if num_components <= 0:
-            raise ValueError(f"num_components must be > 0, got {num_components}.")
+        if hidden_state_dim <= 0:
+            raise ValueError(f"hidden_state_dim must be > 0, got {hidden_state_dim}.")
+        if num_hypotheses <= 0:
+            raise ValueError(f"num_hypotheses must be > 0, got {num_hypotheses}.")
         if eps <= 0:
             raise ValueError(f"eps must be > 0, got {eps}.")
 
-        self.embedding_dim = embedding_dim
-        self.num_components = num_components
-        self.eps = eps
+        output_hypothesis_dim = hidden_state_dim if hypothesis_dim is None else hypothesis_dim
+        if output_hypothesis_dim <= 0:
+            raise ValueError(f"hypothesis_dim must be > 0, got {output_hypothesis_dim}.")
 
-        self.rms_norm = nn.RMSNorm(embedding_dim, eps=eps)
-        self.proj = nn.Linear(embedding_dim, num_components * embedding_dim, bias=bias)
+        self.hidden_state_dim = hidden_state_dim
+        self.num_hypotheses = num_hypotheses
+        self.hypothesis_dim = output_hypothesis_dim
+        flat_output_dim = num_hypotheses * output_hypothesis_dim
+        self.rms_norm = nn.RMSNorm(hidden_state_dim, eps=eps)
+        self.linear_in = nn.Linear(hidden_state_dim, hidden_state_dim, bias=bias)
         self.activation = nn.GELU()
+        self.linear_out = nn.Linear(hidden_state_dim, flat_output_dim, bias=bias)
 
-    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        if inputs.ndim < 2:
-            raise ValueError(f"inputs must have at least 2 dims [..., D], got shape={tuple(inputs.shape)}.")
-        if inputs.shape[-1] != self.embedding_dim:
+    def forward(self, hidden_state: torch.Tensor) -> torch.Tensor:
+        if hidden_state.ndim < 1:
             raise ValueError(
-                f"Last dim mismatch: expected D={self.embedding_dim}, got D={inputs.shape[-1]}."
+                f"hidden_state must have shape [..., hidden_state_dim], got ndim={hidden_state.ndim}."
             )
-        if not inputs.dtype.is_floating_point:
-            raise TypeError(f"inputs must be floating-point tensor, got dtype={inputs.dtype}.")
+        if hidden_state.shape[-1] != self.hidden_state_dim:
+            raise ValueError(
+                "Last dim mismatch: "
+                f"expected hidden_state_dim={self.hidden_state_dim}, got {hidden_state.shape[-1]}."
+            )
+        if not hidden_state.dtype.is_floating_point:
+            raise TypeError(f"hidden_state must be floating-point tensor, got dtype={hidden_state.dtype}.")
 
-        normalized = self.rms_norm(inputs)
-        deltas = self.activation(self.proj(normalized))
-        deltas = deltas.reshape(*inputs.shape[:-1], self.num_components, self.embedding_dim)
-
-        residual_base = inputs.unsqueeze(-2)
-        return residual_base + deltas
+        normalized_state = self.rms_norm(hidden_state)
+        flat_hypotheses = self.linear_out(self.activation(self.linear_in(normalized_state)))
+        return flat_hypotheses.reshape(*hidden_state.shape[:-1], self.num_hypotheses, self.hypothesis_dim)
 
 
 class Matcher(nn.Module):
@@ -101,12 +106,18 @@ class Matcher(nn.Module):
     Apply adapter modulation to input embeddings and compare with references.
 
     Input:
-    - input_embeddings: [B, T, D]
-    - adapters: [M, D] or [B, M, D]
-    - references: [M, D] or [B, M, D]
+    - input_embeddings: [..., D]
+    - references: [..., D]
+    - adapters: [..., D] (same shape as references)
+
+    The module finds the longest shared prefix between input/reference shapes,
+    then treats the remaining input dimensions as "positions" and the remaining
+    reference dimensions as "match axes".
 
     Output:
-    - heatmap similarities in [-1, 1] with shape [B, M, T]
+    - heatmap similarities in [-1, 1] with shape:
+      [*common_prefix, *input_specific_dims, *reference_specific_dims]
+      preserving the input shape structure.
     """
 
     def __init__(self, eps: float = DEFAULT_MATCHER_EPS) -> None:
@@ -121,116 +132,104 @@ class Matcher(nn.Module):
         references: torch.Tensor,
         adapters: torch.Tensor,
     ) -> torch.Tensor:
-        if input_embeddings.ndim != 3:
+        if input_embeddings.ndim < 1:
             raise ValueError(
-                f"input_embeddings must have shape [B, T, D], got ndim={input_embeddings.ndim}."
+                f"input_embeddings must have shape [..., D], got ndim={input_embeddings.ndim}."
             )
-        if references.ndim not in (2, 3):
-            raise ValueError(f"references must have shape [M, D] or [B, M, D], got ndim={references.ndim}.")
-        if adapters.ndim != references.ndim:
-            raise ValueError(
-                f"adapters and references must have the same ndim, got {adapters.ndim} and {references.ndim}."
-            )
-
-        batch_size, _, emb_dim = input_embeddings.shape
-
-        if references.ndim == 2:
-            if references.shape != adapters.shape:
-                raise ValueError(
-                    f"references and adapters shapes must match for 2D mode, got {references.shape} and {adapters.shape}."
-                )
-            if references.shape[-1] != emb_dim:
-                raise ValueError(
-                    f"Embedding dimension mismatch: input D={emb_dim}, refs/adapters D={references.shape[-1]}."
-                )
-
-            adapted = input_embeddings.unsqueeze(2) * adapters.unsqueeze(0).unsqueeze(0)
-            adapted_norm = F.normalize(adapted, dim=-1, eps=self.eps)
-            references_norm = F.normalize(references, dim=-1, eps=self.eps)
-            similarities = torch.einsum("btmd,md->btm", adapted_norm, references_norm)
-            return similarities.transpose(1, 2).contiguous()
-
+        if references.ndim < 1:
+            raise ValueError(f"references must have shape [..., D], got ndim={references.ndim}.")
+        if adapters.ndim < 1:
+            raise ValueError(f"adapters must have shape [..., D], got ndim={adapters.ndim}.")
         if references.shape != adapters.shape:
             raise ValueError(
-                f"references and adapters shapes must match for 3D mode, got {references.shape} and {adapters.shape}."
+                f"adapters and references shapes must match, got {adapters.shape} and {references.shape}."
             )
-        if references.shape[0] != batch_size:
-            raise ValueError(
-                f"Batch mismatch: input B={batch_size}, refs/adapters B={references.shape[0]}."
-            )
+        if not input_embeddings.dtype.is_floating_point:
+            raise TypeError(f"input_embeddings must be floating-point tensor, got dtype={input_embeddings.dtype}.")
+        if not references.dtype.is_floating_point:
+            raise TypeError(f"references must be floating-point tensor, got dtype={references.dtype}.")
+        if not adapters.dtype.is_floating_point:
+            raise TypeError(f"adapters must be floating-point tensor, got dtype={adapters.dtype}.")
+
+        emb_dim = input_embeddings.shape[-1]
         if references.shape[-1] != emb_dim:
             raise ValueError(
                 f"Embedding dimension mismatch: input D={emb_dim}, refs/adapters D={references.shape[-1]}."
             )
 
-        adapted = input_embeddings.unsqueeze(2) * adapters.unsqueeze(1)
+        input_prefix = tuple(input_embeddings.shape[:-1])
+        ref_prefix = tuple(references.shape[:-1])
+
+        # Longest common prefix allows shared context dims (e.g. batch, hierarchy).
+        common_prefix_len = 0
+        for input_dim, ref_dim in zip(input_prefix, ref_prefix):
+            if input_dim == ref_dim:
+                common_prefix_len += 1
+            else:
+                break
+
+        common_prefix = input_prefix[:common_prefix_len]
+        input_specific_dims = input_prefix[common_prefix_len:]
+        ref_specific_dims = ref_prefix[common_prefix_len:]
+
+        common_size = math.prod(common_prefix) if common_prefix else 1
+        input_size = math.prod(input_specific_dims) if input_specific_dims else 1
+        ref_size = math.prod(ref_specific_dims) if ref_specific_dims else 1
+
+        input_view = input_embeddings.reshape(common_size, input_size, emb_dim)
+        references_view = references.reshape(common_size, ref_size, emb_dim)
+        adapters_view = adapters.reshape(common_size, ref_size, emb_dim)
+
+        adapted = input_view.unsqueeze(2) * adapters_view.unsqueeze(1)  # [C, S, M, D]
         adapted_norm = F.normalize(adapted, dim=-1, eps=self.eps)
-        references_norm = F.normalize(references, dim=-1, eps=self.eps)
-        similarities = torch.einsum("btmd,bmd->btm", adapted_norm, references_norm)
-        return similarities.transpose(1, 2).contiguous()
+        references_norm = F.normalize(references_view, dim=-1, eps=self.eps).unsqueeze(1)  # [C, 1, M, D]
+        similarities = (adapted_norm * references_norm).sum(dim=-1)  # [C, S, M]
+
+        return similarities.reshape(*common_prefix, *input_specific_dims, *ref_specific_dims)
 
 
 class Glimpse(nn.Module):
     """
-    Differentiable 1D glimpse over character embeddings using linear interpolation.
+    Differentiable 1D glimpse over character embeddings with linear interpolation.
 
-    Input embeddings:
-    - unbatched: [L, D]
-    - batched: [B, L, D]
+    The module samples a fixed-size window `W` from sequences of length `L` using
+    real-valued positions and border-clamped interpolation.
 
-    Output windows:
-    - with squeeze_output=True (default):
-      - [W, D] when input is unbatched and num_glimpses=1
-      - [G, W, D] when input is unbatched and num_glimpses=G
-      - [B, W, D] when input is batched and num_glimpses=1
-      - [B, G, W, D] when input is batched and num_glimpses=G
-    - with squeeze_output=False:
-      - always [B, G, W, D]
+    Inputs:
+    - `input_embeddings`: [L, D] or [B, L, D]
+    - `center_logits`, `zoom_logits`: scalar, [G], or [B, G]-like (including [1, G], [B, 1])
+      where `G` is the number of glimpses. Controls are external: this module has no
+      internal center/zoom parameters.
+    - `lengths` (optional): scalar or [B], valid length per sequence for clamped sampling.
 
-    Center/zoom controls are represented as logits and passed through sigmoid.
-    This keeps optimization unconstrained while ensuring valid [0, 1] control values.
+    Glimpse count:
+    - `G` is inferred per forward pass from control shapes.
+    - If one control has shape [*, 1] and the other [*, G], the singleton control is broadcast.
+
+    Outputs:
+    - If `squeeze_output=True`:
+      - unbatched + G=1 -> [W, D]
+      - unbatched + G>1 -> [G, W, D]
+      - batched + G=1 -> [B, W, D]
+      - batched + G>1 -> [B, G, W, D]
+    - If `squeeze_output=False`: always [B, G, W, D]
     """
 
     def __init__(
         self,
         window_size: int,
-        num_glimpses: int = 1,
-        init_center_fraction: float = 0.5,
-        init_zoom_fraction: float = 0.0,
-        learnable: bool = True,
         eps: float = DEFAULT_MATCHER_EPS,
         squeeze_output: bool = True,
     ) -> None:
         super().__init__()
         if window_size <= 0:
             raise ValueError(f"window_size must be > 0, got {window_size}.")
-        if num_glimpses <= 0:
-            raise ValueError(f"num_glimpses must be > 0, got {num_glimpses}.")
-        if not (0.0 <= init_center_fraction <= 1.0):
-            raise ValueError(f"init_center_fraction must be in [0, 1], got {init_center_fraction}.")
-        if not (0.0 <= init_zoom_fraction <= 1.0):
-            raise ValueError(f"init_zoom_fraction must be in [0, 1], got {init_zoom_fraction}.")
         if eps <= 0:
             raise ValueError(f"eps must be > 0, got {eps}.")
 
         self.window_size = window_size
-        self.num_glimpses = num_glimpses
         self.eps = eps
         self.squeeze_output = squeeze_output
-
-        center_logits = torch.full((num_glimpses,), self._prob_to_logit(init_center_fraction), dtype=torch.float32)
-        zoom_logits = torch.full((num_glimpses,), self._prob_to_logit(init_zoom_fraction), dtype=torch.float32)
-        if learnable:
-            self.center_logits = nn.Parameter(center_logits)
-            self.zoom_logits = nn.Parameter(zoom_logits)
-        else:
-            self.register_buffer("center_logits", center_logits)
-            self.register_buffer("zoom_logits", zoom_logits)
-
-    @staticmethod
-    def _prob_to_logit(prob: float, eps: float = 1e-6) -> float:
-        clipped = min(max(prob, eps), 1.0 - eps)
-        return float(torch.logit(torch.tensor(clipped)).item())
 
     def _prepare_lengths(
         self,
@@ -261,61 +260,64 @@ class Glimpse(nn.Module):
             raise ValueError(f"All lengths must be <= seq_len ({seq_len}).")
         return valid_lengths
 
-    def _expand_logits(
+    def _normalize_logits_to_matrix(
         self,
         logit_values: torch.Tensor,
-        batch_size: int,
         device: torch.device,
         dtype: torch.dtype,
     ) -> torch.Tensor:
-        # Accepted shapes:
-        # - scalar: shared across batch and glimpses
-        # - [G]: one value per glimpse, shared across batch
-        # - [B]: one value per batch element, shared across glimpses
-        # - [B, G] (or broadcastable [1, G] / [B, 1])
+        # Normalize controls to a 2D matrix [batch_like, glimpse_like].
+        # Broadcasting to the actual [B, G] happens in `_expand_logits_to_batch_and_glimpses`.
         expanded_logits = torch.as_tensor(logit_values, device=device, dtype=dtype).to(device=device, dtype=dtype)
 
         if expanded_logits.ndim == 0:
-            return expanded_logits.view(1, 1).expand(batch_size, self.num_glimpses)
+            return expanded_logits.view(1, 1)
 
         if expanded_logits.ndim == 1:
-            n = expanded_logits.shape[0]
-            if n == self.num_glimpses:
-                return expanded_logits.view(1, self.num_glimpses).expand(batch_size, self.num_glimpses)
-            if n == batch_size:
-                return expanded_logits.view(batch_size, 1).expand(batch_size, self.num_glimpses)
-            if n == 1:
-                return expanded_logits.view(1, 1).expand(batch_size, self.num_glimpses)
-            raise ValueError(
-                f"1D logits must have size 1, num_glimpses ({self.num_glimpses}), or batch_size ({batch_size}); got {n}."
-            )
+            return expanded_logits.view(1, expanded_logits.shape[0])
 
         if expanded_logits.ndim == 2:
-            logits_batch, logits_glimpses = expanded_logits.shape
-            if logits_batch not in (1, batch_size):
-                raise ValueError(f"2D logits batch dim must be 1 or {batch_size}, got {logits_batch}.")
-            if logits_glimpses not in (1, self.num_glimpses):
-                raise ValueError(f"2D logits glimpse dim must be 1 or {self.num_glimpses}, got {logits_glimpses}.")
-            return expanded_logits.expand(batch_size, self.num_glimpses)
+            return expanded_logits
 
         raise ValueError(f"logits must be scalar, 1D, or 2D tensor, got ndim={expanded_logits.ndim}.")
 
-    def _format_output(self, output: torch.Tensor, input_was_unbatched: bool) -> torch.Tensor:
+    def _expand_logits_to_batch_and_glimpses(
+        self,
+        logits_matrix: torch.Tensor,
+        batch_size: int,
+        num_glimpses: int,
+        logits_name: str,
+    ) -> torch.Tensor:
+        # Expand [batch_like, glimpse_like] controls to the concrete [B, G] shape.
+        # Each dimension can be either exact-size or singleton for broadcasting.
+        logits_batch, logits_glimpses = logits_matrix.shape
+        if logits_batch not in (1, batch_size):
+            raise ValueError(f"{logits_name} batch dim must be 1 or {batch_size}, got {logits_batch}.")
+        if logits_glimpses not in (1, num_glimpses):
+            raise ValueError(f"{logits_name} glimpse dim must be 1 or {num_glimpses}, got {logits_glimpses}.")
+        return logits_matrix.expand(batch_size, num_glimpses)
+
+    def _format_output(
+        self,
+        output: torch.Tensor,
+        input_was_unbatched: bool,
+        num_glimpses: int,
+    ) -> torch.Tensor:
         if not self.squeeze_output:
             return output
         if input_was_unbatched:
-            return output[0, 0] if self.num_glimpses == 1 else output[0]
-        return output[:, 0] if self.num_glimpses == 1 else output
+            return output[0, 0] if num_glimpses == 1 else output[0]
+        return output[:, 0] if num_glimpses == 1 else output
 
     def forward(
         self,
         input_embeddings: torch.Tensor,
-        center_logits: torch.Tensor | None = None,
-        zoom_logits: torch.Tensor | None = None,
+        center_logits: torch.Tensor,
+        zoom_logits: torch.Tensor,
         lengths: torch.Tensor | None = None,
         return_aux: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        # Normalize input to [B, L, D] for unified vectorized computation.
+        # Normalize embeddings to [B, L, D] so all downstream ops are fully vectorized.
         was_unbatched = input_embeddings.ndim == 2
         if was_unbatched:
             input_embeddings = input_embeddings.unsqueeze(0)
@@ -330,25 +332,33 @@ class Glimpse(nn.Module):
         if not input_embeddings.dtype.is_floating_point:
             raise TypeError(f"input_embeddings must be floating-point tensor, got dtype={input_embeddings.dtype}.")
 
+        # Resolve valid sequence lengths and broadcast control logits to [B, G].
         valid_lengths = self._prepare_lengths(lengths, batch_size, seq_len, device, dtype)
-        center_logits_expanded = self._expand_logits(
-            self.center_logits if center_logits is None else center_logits,
+        center_logits_matrix = self._normalize_logits_to_matrix(center_logits, device, dtype)
+        zoom_logits_matrix = self._normalize_logits_to_matrix(zoom_logits, device, dtype)
+
+        num_glimpses = max(center_logits_matrix.shape[1], zoom_logits_matrix.shape[1])
+        if num_glimpses <= 0:
+            raise ValueError("num_glimpses must be > 0 after expanding logits.")
+
+        center_logits_expanded = self._expand_logits_to_batch_and_glimpses(
+            center_logits_matrix,
             batch_size,
-            device,
-            dtype,
+            num_glimpses,
+            "center_logits",
         )
-        zoom_logits_expanded = self._expand_logits(
-            self.zoom_logits if zoom_logits is None else zoom_logits,
+        zoom_logits_expanded = self._expand_logits_to_batch_and_glimpses(
+            zoom_logits_matrix,
             batch_size,
-            device,
-            dtype,
+            num_glimpses,
+            "zoom_logits",
         )
 
-        # Convert unconstrained logits to valid normalized controls in [0, 1].
+        # Convert unconstrained logits to normalized controls in [0, 1].
         center_fraction = torch.sigmoid(center_logits_expanded)
         zoom_fraction = torch.sigmoid(zoom_logits_expanded)
 
-        # Geometric window parameters.
+        # Compute geometric parameters (center bounds and zoom-dependent spacing).
         half_window = (self.window_size - 1) / 2.0
         if self.window_size == 1:
             max_spacing = torch.ones(batch_size, device=device, dtype=dtype)
@@ -362,30 +372,31 @@ class Glimpse(nn.Module):
         center_min = torch.where(window_fits_inside_valid_length, center_min_raw, center_midpoint)
         center_max = torch.where(window_fits_inside_valid_length, center_max_raw, center_midpoint)
 
-        # Center c and spacing s for each [batch, glimpse].
+        # Compute center and spacing per [batch, glimpse].
         center_positions = center_min.unsqueeze(1) + center_fraction * (center_max - center_min).unsqueeze(1)
         if self.window_size == 1:
             sampling_spacings = torch.ones_like(center_positions)
         else:
             sampling_spacings = 1.0 + zoom_fraction * (max_spacing - 1.0).unsqueeze(1)
 
-        # Real-valued sample positions u_j = c + s*(j - h).
+        # Real-valued sampling coordinates per slot: u_j = center + spacing * offset_j.
         slot_offsets = torch.arange(self.window_size, device=device, dtype=dtype) - half_window
         sample_positions = center_positions.unsqueeze(-1) + sampling_spacings.unsqueeze(-1) * slot_offsets.view(1, 1, self.window_size)
 
-        # Linear interpolation setup: y = (1-alpha)*E[i0] + alpha*E[i1].
+        # Linear interpolation endpoints and mixing factor:
+        # y = (1 - alpha) * E[left] + alpha * E[right].
         left_indices_float = torch.floor(sample_positions)
         interpolation_alpha = (sample_positions - left_indices_float).unsqueeze(-1)
         left_indices = left_indices_float.to(torch.long)
         right_indices = left_indices + 1
 
-        # Border policy = replicate/clamp to valid range [0, length-1].
+        # Border policy: replicate edges by clamping indices to [0, valid_length - 1].
         max_valid_index = (valid_lengths.to(torch.long) - 1).view(batch_size, 1, 1)
         zero_idx = torch.zeros((), device=device, dtype=torch.long)
         left_indices = torch.minimum(torch.maximum(left_indices, zero_idx), max_valid_index)
         right_indices = torch.minimum(torch.maximum(right_indices, zero_idx), max_valid_index)
 
-        # Gather left/right endpoints in parallel for all batch x glimpse x slot.
+        # Gather interpolation endpoints for all [B, G, W] coordinates in parallel.
         flat_left_indices = left_indices.reshape(batch_size, -1)
         flat_right_indices = right_indices.reshape(batch_size, -1)
 
@@ -393,15 +404,19 @@ class Glimpse(nn.Module):
             input_embeddings,
             dim=1,
             index=flat_left_indices.unsqueeze(-1).expand(batch_size, flat_left_indices.shape[1], emb_dim),
-        ).reshape(batch_size, self.num_glimpses, self.window_size, emb_dim)
+        ).reshape(batch_size, num_glimpses, self.window_size, emb_dim)
         right_embeddings = torch.gather(
             input_embeddings,
             dim=1,
             index=flat_right_indices.unsqueeze(-1).expand(batch_size, flat_right_indices.shape[1], emb_dim),
-        ).reshape(batch_size, self.num_glimpses, self.window_size, emb_dim)
+        ).reshape(batch_size, num_glimpses, self.window_size, emb_dim)
 
         glimpse_windows = (1.0 - interpolation_alpha) * left_embeddings + interpolation_alpha * right_embeddings
-        formatted = self._format_output(glimpse_windows, input_was_unbatched=was_unbatched)
+        formatted = self._format_output(
+            glimpse_windows,
+            input_was_unbatched=was_unbatched,
+            num_glimpses=num_glimpses,
+        )
 
         if not return_aux:
             return formatted
