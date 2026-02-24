@@ -292,6 +292,83 @@ class HypothesisObservationComposer(nn.Module):
         return observation_embeddings, aux
 
 
+class HypothesisUpdater(nn.Module):
+    """
+    Fuse each hypothesis embedding with its observation embedding.
+
+    Inputs:
+    - hypotheses: [..., D_h]
+    - observations: [..., D_o]
+
+    Output:
+    - updated_hypotheses: [..., D_u]
+
+    Architecture:
+    - concat([hypothesis, observation]) -> Linear -> GeLU -> Linear
+    """
+
+    def __init__(
+        self,
+        hypothesis_dim: int,
+        observation_dim: int | None = None,
+        updated_dim: int | None = None,
+        hidden_dim: int | None = None,
+        bias: bool = True,
+    ) -> None:
+        super().__init__()
+        if hypothesis_dim <= 0:
+            raise ValueError(f"hypothesis_dim must be > 0, got {hypothesis_dim}.")
+
+        resolved_observation_dim = hypothesis_dim if observation_dim is None else observation_dim
+        if resolved_observation_dim <= 0:
+            raise ValueError(f"observation_dim must be > 0, got {resolved_observation_dim}.")
+
+        resolved_updated_dim = hypothesis_dim if updated_dim is None else updated_dim
+        if resolved_updated_dim <= 0:
+            raise ValueError(f"updated_dim must be > 0, got {resolved_updated_dim}.")
+
+        input_dim = hypothesis_dim + resolved_observation_dim
+        resolved_hidden_dim = input_dim if hidden_dim is None else hidden_dim
+        if resolved_hidden_dim <= 0:
+            raise ValueError(f"hidden_dim must be > 0, got {resolved_hidden_dim}.")
+
+        self.hypothesis_dim = hypothesis_dim
+        self.observation_dim = resolved_observation_dim
+        self.updated_dim = resolved_updated_dim
+        self.hidden_dim = resolved_hidden_dim
+
+        self.linear_in = nn.Linear(input_dim, resolved_hidden_dim, bias=bias)
+        self.activation = nn.GELU()
+        self.linear_out = nn.Linear(resolved_hidden_dim, resolved_updated_dim, bias=bias)
+
+    def forward(self, hypotheses: torch.Tensor, observations: torch.Tensor) -> torch.Tensor:
+        if hypotheses.ndim < 1:
+            raise ValueError(f"hypotheses must have shape [..., D_h], got ndim={hypotheses.ndim}.")
+        if observations.ndim < 1:
+            raise ValueError(f"observations must have shape [..., D_o], got ndim={observations.ndim}.")
+        if hypotheses.shape[:-1] != observations.shape[:-1]:
+            raise ValueError(
+                "Prefix shape mismatch: hypotheses and observations must share leading dimensions. "
+                f"Got {hypotheses.shape} and {observations.shape}."
+            )
+        if hypotheses.shape[-1] != self.hypothesis_dim:
+            raise ValueError(
+                f"Hypothesis dim mismatch: expected D_h={self.hypothesis_dim}, got {hypotheses.shape[-1]}."
+            )
+        if observations.shape[-1] != self.observation_dim:
+            raise ValueError(
+                f"Observation dim mismatch: expected D_o={self.observation_dim}, got {observations.shape[-1]}."
+            )
+        if not hypotheses.dtype.is_floating_point:
+            raise TypeError(f"hypotheses must be floating-point tensor, got dtype={hypotheses.dtype}.")
+        if not observations.dtype.is_floating_point:
+            raise TypeError(f"observations must be floating-point tensor, got dtype={observations.dtype}.")
+
+        fused_inputs = torch.cat([hypotheses, observations], dim=-1)
+        hidden = self.activation(self.linear_in(fused_inputs))
+        return self.linear_out(hidden)
+
+
 class Matcher(nn.Module):
     """
     Apply adapter modulation to input embeddings and compare with references.
