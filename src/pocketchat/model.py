@@ -369,6 +369,81 @@ class HypothesisUpdater(nn.Module):
         return self.linear_out(hidden)
 
 
+class HiddenStateDeltaPredictor(nn.Module):
+    """
+    Predict a hidden-state delta from all updated hypotheses.
+
+    Input:
+    - updated_hypotheses: [..., H, D_u]
+
+    Output:
+    - hidden_state_delta: [..., D_h]
+
+    Architecture:
+    - flatten [..., H, D_u] -> [..., H*D_u]
+    - Linear -> GeLU -> Linear
+    """
+
+    def __init__(
+        self,
+        num_hypotheses: int,
+        updated_hypothesis_dim: int,
+        hidden_state_dim: int | None = None,
+        hidden_dim: int | None = None,
+        bias: bool = True,
+    ) -> None:
+        super().__init__()
+        if num_hypotheses <= 0:
+            raise ValueError(f"num_hypotheses must be > 0, got {num_hypotheses}.")
+        if updated_hypothesis_dim <= 0:
+            raise ValueError(f"updated_hypothesis_dim must be > 0, got {updated_hypothesis_dim}.")
+
+        resolved_hidden_state_dim = updated_hypothesis_dim if hidden_state_dim is None else hidden_state_dim
+        if resolved_hidden_state_dim <= 0:
+            raise ValueError(f"hidden_state_dim must be > 0, got {resolved_hidden_state_dim}.")
+
+        input_dim = num_hypotheses * updated_hypothesis_dim
+        resolved_hidden_dim = input_dim if hidden_dim is None else hidden_dim
+        if resolved_hidden_dim <= 0:
+            raise ValueError(f"hidden_dim must be > 0, got {resolved_hidden_dim}.")
+
+        self.num_hypotheses = num_hypotheses
+        self.updated_hypothesis_dim = updated_hypothesis_dim
+        self.hidden_state_dim = resolved_hidden_state_dim
+        self.hidden_dim = resolved_hidden_dim
+        self.input_dim = input_dim
+
+        self.linear_in = nn.Linear(input_dim, resolved_hidden_dim, bias=bias)
+        self.activation = nn.GELU()
+        self.linear_out = nn.Linear(resolved_hidden_dim, resolved_hidden_state_dim, bias=bias)
+
+    def forward(self, updated_hypotheses: torch.Tensor) -> torch.Tensor:
+        if updated_hypotheses.ndim < 2:
+            raise ValueError(
+                "updated_hypotheses must have shape [..., H, D_u], "
+                f"got shape={tuple(updated_hypotheses.shape)}."
+            )
+        if updated_hypotheses.shape[-2] != self.num_hypotheses:
+            raise ValueError(
+                "Num hypotheses mismatch: "
+                f"expected H={self.num_hypotheses}, got H={updated_hypotheses.shape[-2]}."
+            )
+        if updated_hypotheses.shape[-1] != self.updated_hypothesis_dim:
+            raise ValueError(
+                "Updated hypothesis dim mismatch: "
+                f"expected D_u={self.updated_hypothesis_dim}, got D_u={updated_hypotheses.shape[-1]}."
+            )
+        if not updated_hypotheses.dtype.is_floating_point:
+            raise TypeError(
+                "updated_hypotheses must be floating-point tensor, "
+                f"got dtype={updated_hypotheses.dtype}."
+            )
+
+        flat_hypotheses = updated_hypotheses.reshape(*updated_hypotheses.shape[:-2], self.input_dim)
+        hidden = self.activation(self.linear_in(flat_hypotheses))
+        return self.linear_out(hidden)
+
+
 class Matcher(nn.Module):
     """
     Apply adapter modulation to input embeddings and compare with references.
