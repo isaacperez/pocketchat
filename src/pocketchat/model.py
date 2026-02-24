@@ -101,6 +101,197 @@ class HypothesisGenerator(nn.Module):
         return flat_hypotheses.reshape(*hidden_state.shape[:-1], self.num_hypotheses, self.hypothesis_dim)
 
 
+class HypothesisDecomposer(nn.Module):
+    """
+    Decompose each hypothesis embedding into control and matching signals.
+
+    For every hypothesis vector `[..., D_h]`, this module generates `K` parts.
+    Each part contains:
+    - one `center_logit` for Glimpse
+    - one `zoom_logit` for Glimpse
+    - one `reference` embedding for Matcher
+    - one `adapter` embedding for Matcher
+
+    Output shapes:
+    - `center_logits`: [..., K]
+    - `zoom_logits`: [..., K]
+    - `references`: [..., K, D_m]
+    - `adapters`: [..., K, D_m]
+
+    Architecture:
+    - Shared pre-normalization: RMSNorm on hypothesis embeddings.
+    - Four independent heads (one per output), each with:
+      Linear -> GeLU -> Linear
+    """
+
+    def __init__(
+        self,
+        hypothesis_dim: int,
+        num_parts: int,
+        matcher_dim: int | None = None,
+        hidden_dim: int | None = None,
+        eps: float = DEFAULT_MATCHER_EPS,
+        bias: bool = True,
+    ) -> None:
+        super().__init__()
+        if hypothesis_dim <= 0:
+            raise ValueError(f"hypothesis_dim must be > 0, got {hypothesis_dim}.")
+        if num_parts <= 0:
+            raise ValueError(f"num_parts must be > 0, got {num_parts}.")
+        if eps <= 0:
+            raise ValueError(f"eps must be > 0, got {eps}.")
+
+        output_matcher_dim = hypothesis_dim if matcher_dim is None else matcher_dim
+        if output_matcher_dim <= 0:
+            raise ValueError(f"matcher_dim must be > 0, got {output_matcher_dim}.")
+
+        head_hidden_dim = hypothesis_dim if hidden_dim is None else hidden_dim
+        if head_hidden_dim <= 0:
+            raise ValueError(f"hidden_dim must be > 0, got {head_hidden_dim}.")
+
+        self.hypothesis_dim = hypothesis_dim
+        self.num_parts = num_parts
+        self.matcher_dim = output_matcher_dim
+        self.hidden_dim = head_hidden_dim
+        self.rms_norm = nn.RMSNorm(hypothesis_dim, eps=eps)
+
+        self.center_head = self._build_head(hypothesis_dim, head_hidden_dim, num_parts, bias=bias)
+        self.zoom_head = self._build_head(hypothesis_dim, head_hidden_dim, num_parts, bias=bias)
+        self.reference_head = self._build_head(
+            hypothesis_dim,
+            head_hidden_dim,
+            num_parts * output_matcher_dim,
+            bias=bias,
+        )
+        self.adapter_head = self._build_head(
+            hypothesis_dim,
+            head_hidden_dim,
+            num_parts * output_matcher_dim,
+            bias=bias,
+        )
+
+    @staticmethod
+    def _build_head(input_dim: int, hidden_dim: int, output_dim: int, bias: bool) -> nn.Sequential:
+        return nn.Sequential(
+            nn.Linear(input_dim, hidden_dim, bias=bias),
+            nn.GELU(),
+            nn.Linear(hidden_dim, output_dim, bias=bias),
+        )
+
+    def forward(
+        self,
+        hypothesis_embeddings: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if hypothesis_embeddings.ndim < 1:
+            raise ValueError(
+                "hypothesis_embeddings must have shape [..., hypothesis_dim], "
+                f"got ndim={hypothesis_embeddings.ndim}."
+            )
+        if hypothesis_embeddings.shape[-1] != self.hypothesis_dim:
+            raise ValueError(
+                "Last dim mismatch: "
+                f"expected hypothesis_dim={self.hypothesis_dim}, got {hypothesis_embeddings.shape[-1]}."
+            )
+        if not hypothesis_embeddings.dtype.is_floating_point:
+            raise TypeError(
+                "hypothesis_embeddings must be floating-point tensor, "
+                f"got dtype={hypothesis_embeddings.dtype}."
+            )
+
+        normalized_hypotheses = self.rms_norm(hypothesis_embeddings)
+        center_logits = self.center_head(normalized_hypotheses)
+        zoom_logits = self.zoom_head(normalized_hypotheses)
+        references = self.reference_head(normalized_hypotheses).reshape(
+            *hypothesis_embeddings.shape[:-1],
+            self.num_parts,
+            self.matcher_dim,
+        )
+        adapters = self.adapter_head(normalized_hypotheses).reshape(
+            *hypothesis_embeddings.shape[:-1],
+            self.num_parts,
+            self.matcher_dim,
+        )
+        return center_logits, zoom_logits, references, adapters
+
+
+class HypothesisObservationComposer(nn.Module):
+    """
+    Compose part-level heatmaps into one observation embedding per hypothesis.
+
+    Input:
+    - part_heatmaps: [..., K, W]
+      K = number of parts, W = glimpse window size
+
+    Output:
+    - observation_embeddings: [..., D_obs]
+
+    Architecture:
+    - flatten [..., K, W] -> [..., K*W]
+    - Linear -> GeLU -> Linear
+    """
+
+    def __init__(
+        self,
+        num_parts: int,
+        window_size: int,
+        observation_dim: int,
+        hidden_dim: int | None = None,
+        bias: bool = True,
+    ) -> None:
+        super().__init__()
+        if num_parts <= 0:
+            raise ValueError(f"num_parts must be > 0, got {num_parts}.")
+        if window_size <= 0:
+            raise ValueError(f"window_size must be > 0, got {window_size}.")
+        if observation_dim <= 0:
+            raise ValueError(f"observation_dim must be > 0, got {observation_dim}.")
+
+        self.num_parts = num_parts
+        self.window_size = window_size
+        self.observation_dim = observation_dim
+        self.input_dim = num_parts * window_size
+        self.hidden_dim = self.input_dim if hidden_dim is None else hidden_dim
+        if self.hidden_dim <= 0:
+            raise ValueError(f"hidden_dim must be > 0, got {self.hidden_dim}.")
+
+        self.linear_in = nn.Linear(self.input_dim, self.hidden_dim, bias=bias)
+        self.activation = nn.GELU()
+        self.linear_out = nn.Linear(self.hidden_dim, observation_dim, bias=bias)
+
+    def forward(
+        self,
+        part_heatmaps: torch.Tensor,
+        return_aux: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        if part_heatmaps.ndim < 2:
+            raise ValueError(
+                "part_heatmaps must have shape [..., K, W], "
+                f"got shape={tuple(part_heatmaps.shape)}."
+            )
+        if part_heatmaps.shape[-2] != self.num_parts:
+            raise ValueError(
+                f"Part dimension mismatch: expected K={self.num_parts}, got K={part_heatmaps.shape[-2]}."
+            )
+        if part_heatmaps.shape[-1] != self.window_size:
+            raise ValueError(
+                f"Window dimension mismatch: expected W={self.window_size}, got W={part_heatmaps.shape[-1]}."
+            )
+        if not part_heatmaps.dtype.is_floating_point:
+            raise TypeError(f"part_heatmaps must be floating-point tensor, got dtype={part_heatmaps.dtype}.")
+
+        flat_heatmaps = part_heatmaps.reshape(*part_heatmaps.shape[:-2], self.input_dim)
+        hidden = self.activation(self.linear_in(flat_heatmaps))
+        observation_embeddings = self.linear_out(hidden)
+
+        if not return_aux:
+            return observation_embeddings
+        aux = {
+            "flat_heatmaps": flat_heatmaps,
+            "hidden_features": hidden,
+        }
+        return observation_embeddings, aux
+
+
 class Matcher(nn.Module):
     """
     Apply adapter modulation to input embeddings and compare with references.
