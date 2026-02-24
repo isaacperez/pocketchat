@@ -13,6 +13,7 @@ def test_cortex_forward_batched_pipeline_shapes() -> None:
         num_parts=2,
         window_size=4,
         num_iterations=3,
+        num_next_chars=4,
         hypothesis_dim=5,
         observation_dim=5,
         updated_hypothesis_dim=5,
@@ -27,6 +28,10 @@ def test_cortex_forward_batched_pipeline_shapes() -> None:
     assert outputs["hidden_state_delta_history"].shape == (2, 6, 3)
     assert outputs["hypothesis_update_history"].shape == (2, 3, 3, 5)
     assert outputs["last_updated_hypotheses"].shape == (2, 3, 5)
+    assert outputs["next_char_logits"].shape == (2, 4, 32)
+    assert outputs["next_char_predictions"].shape == (2, 4)
+    assert outputs["next_char_predictions"].dtype == torch.long
+    assert model.next_char_predictor.tie_with_embedding
 
 
 def test_cortex_forward_unbatched_shapes() -> None:
@@ -39,6 +44,7 @@ def test_cortex_forward_unbatched_shapes() -> None:
         num_parts=2,
         window_size=3,
         num_iterations=2,
+        num_next_chars=3,
         hypothesis_dim=4,
         observation_dim=4,
         updated_hypothesis_dim=4,
@@ -53,6 +59,9 @@ def test_cortex_forward_unbatched_shapes() -> None:
     assert outputs["hidden_state_delta_history"].shape == (6, 2)
     assert outputs["hypothesis_update_history"].shape == (2, 2, 4)
     assert outputs["last_updated_hypotheses"].shape == (2, 4)
+    assert outputs["next_char_logits"].shape == (3, 20)
+    assert outputs["next_char_predictions"].shape == (3,)
+    assert outputs["next_char_predictions"].dtype == torch.long
 
 
 def test_cortex_supports_lengths_for_hidden_state_and_glimpse() -> None:
@@ -125,6 +134,7 @@ def test_cortex_validates_constructor_arguments() -> None:
         {"vocab_size": 10, "embedding_dim": 8, "num_parts": 0},
         {"vocab_size": 10, "embedding_dim": 8, "window_size": 0},
         {"vocab_size": 10, "embedding_dim": 8, "num_iterations": 0},
+        {"vocab_size": 10, "embedding_dim": 8, "num_next_chars": 0},
         {"vocab_size": 10, "embedding_dim": 8, "matcher_eps": 0.0},
     )
 

@@ -19,6 +19,7 @@ class Cortex(nn.Module):
         num_parts: int = 2,
         window_size: int = 8,
         num_iterations: int = 2,
+        num_next_chars: int = 4,
         hypothesis_dim: int | None = None,
         observation_dim: int | None = None,
         updated_hypothesis_dim: int | None = None,
@@ -37,6 +38,8 @@ class Cortex(nn.Module):
             raise ValueError(f"window_size must be > 0, got {window_size}.")
         if num_iterations <= 0:
             raise ValueError(f"num_iterations must be > 0, got {num_iterations}.")
+        if num_next_chars <= 0:
+            raise ValueError(f"num_next_chars must be > 0, got {num_next_chars}.")
         if matcher_eps <= 0:
             raise ValueError(f"matcher_eps must be > 0, got {matcher_eps}.")
         if padding_idx is not None and not (0 <= padding_idx < vocab_size):
@@ -70,6 +73,7 @@ class Cortex(nn.Module):
         self.num_parts = num_parts
         self.window_size = window_size
         self.num_iterations = num_iterations
+        self.num_next_chars = num_next_chars
         self.hypothesis_dim = resolved_hypothesis_dim
         self.observation_dim = resolved_observation_dim
         self.updated_hypothesis_dim = resolved_updated_hypothesis_dim
@@ -105,6 +109,15 @@ class Cortex(nn.Module):
             num_hypotheses=num_hypotheses,
             updated_hypothesis_dim=resolved_updated_hypothesis_dim,
             hidden_state_dim=resolved_hidden_state_dim,
+        )
+        self.next_char_predictor = NextCharPredictor(
+            num_hypotheses=num_hypotheses,
+            num_iterations=num_iterations,
+            updated_hypothesis_dim=resolved_updated_hypothesis_dim,
+            vocab_size=vocab_size,
+            num_next_chars=num_next_chars,
+            tie_with_embedding=True,
+            tied_embedding_dim=embedding_dim,
         )
 
     def forward(
@@ -160,6 +173,11 @@ class Cortex(nn.Module):
         hypothesis_update_history = torch.stack(updated_hypotheses_history, dim=2)
         # [B, D_hidden, N]
         hidden_state_delta_history = torch.stack(hidden_state_deltas, dim=-1)
+        next_char_logits = self.next_char_predictor(
+            hypothesis_update_history,
+            embedding_weight=self.char_embeddings.weight,
+        )  # [B, N_pred, V]
+        next_char_predictions = next_char_logits.argmax(dim=-1)  # [B, N_pred]
 
         outputs: dict[str, torch.Tensor] = {
             "token_embeddings": token_embeddings,
@@ -168,6 +186,8 @@ class Cortex(nn.Module):
             "hidden_state_delta_history": hidden_state_delta_history,
             "hypothesis_update_history": hypothesis_update_history,
             "last_updated_hypotheses": updated_hypotheses_history[-1],
+            "next_char_logits": next_char_logits,
+            "next_char_predictions": next_char_predictions,
         }
         if was_unbatched:
             outputs = {name: tensor.squeeze(0) for name, tensor in outputs.items()}
@@ -576,6 +596,140 @@ class HiddenStateDeltaPredictor(nn.Module):
         flat_hypotheses = updated_hypotheses.reshape(*updated_hypotheses.shape[:-2], self.input_dim)
         hidden = self.activation(self.linear_in(flat_hypotheses))
         return self.linear_out(hidden)
+
+
+class NextCharPredictor(nn.Module):
+    """
+    Predict logits for the next N characters from hypothesis update history.
+
+    Input:
+    - hypothesis_update_history: [..., H, N_iter, D_u]
+
+    Output:
+    - next_char_logits: [..., N_pred, V]
+      N_pred = number of next characters to predict
+      V = vocabulary size
+
+    Architecture:
+    - flatten [..., H, N_iter, D_u] -> [..., H*N_iter*D_u]
+    - Linear -> GeLU -> Linear
+    - If `tie_with_embedding=False`: reshape -> [..., N_pred, V]
+    - If `tie_with_embedding=True`: reshape -> [..., N_pred, D_e], then logits via
+      dot-product with shared embedding weights [V, D_e]
+    """
+
+    def __init__(
+        self,
+        num_hypotheses: int,
+        num_iterations: int,
+        updated_hypothesis_dim: int,
+        vocab_size: int,
+        num_next_chars: int,
+        hidden_dim: int | None = None,
+        tie_with_embedding: bool = False,
+        tied_embedding_dim: int | None = None,
+        bias: bool = True,
+    ) -> None:
+        super().__init__()
+        if num_hypotheses <= 0:
+            raise ValueError(f"num_hypotheses must be > 0, got {num_hypotheses}.")
+        if num_iterations <= 0:
+            raise ValueError(f"num_iterations must be > 0, got {num_iterations}.")
+        if updated_hypothesis_dim <= 0:
+            raise ValueError(f"updated_hypothesis_dim must be > 0, got {updated_hypothesis_dim}.")
+        if vocab_size <= 0:
+            raise ValueError(f"vocab_size must be > 0, got {vocab_size}.")
+        if num_next_chars <= 0:
+            raise ValueError(f"num_next_chars must be > 0, got {num_next_chars}.")
+        if tie_with_embedding and (tied_embedding_dim is None or tied_embedding_dim <= 0):
+            raise ValueError(
+                "tied_embedding_dim must be > 0 when tie_with_embedding=True, "
+                f"got {tied_embedding_dim}."
+            )
+
+        self.num_hypotheses = num_hypotheses
+        self.num_iterations = num_iterations
+        self.updated_hypothesis_dim = updated_hypothesis_dim
+        self.vocab_size = vocab_size
+        self.num_next_chars = num_next_chars
+        self.tie_with_embedding = tie_with_embedding
+        self.tied_embedding_dim = tied_embedding_dim
+        self.input_dim = num_hypotheses * num_iterations * updated_hypothesis_dim
+        self.hidden_dim = self.input_dim if hidden_dim is None else hidden_dim
+        if self.hidden_dim <= 0:
+            raise ValueError(f"hidden_dim must be > 0, got {self.hidden_dim}.")
+
+        self.linear_in = nn.Linear(self.input_dim, self.hidden_dim, bias=bias)
+        self.activation = nn.GELU()
+        output_dim = (
+            num_next_chars * tied_embedding_dim
+            if tie_with_embedding
+            else num_next_chars * vocab_size
+        )
+        self.linear_out = nn.Linear(self.hidden_dim, output_dim, bias=bias)
+
+    def forward(
+        self,
+        hypothesis_update_history: torch.Tensor,
+        embedding_weight: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if hypothesis_update_history.ndim < 3:
+            raise ValueError(
+                "hypothesis_update_history must have shape [..., H, N_iter, D_u], "
+                f"got shape={tuple(hypothesis_update_history.shape)}."
+            )
+        if hypothesis_update_history.shape[-3] != self.num_hypotheses:
+            raise ValueError(
+                "Num hypotheses mismatch: "
+                f"expected H={self.num_hypotheses}, got H={hypothesis_update_history.shape[-3]}."
+            )
+        if hypothesis_update_history.shape[-2] != self.num_iterations:
+            raise ValueError(
+                "Num iterations mismatch: "
+                f"expected N_iter={self.num_iterations}, got N_iter={hypothesis_update_history.shape[-2]}."
+            )
+        if hypothesis_update_history.shape[-1] != self.updated_hypothesis_dim:
+            raise ValueError(
+                "Updated hypothesis dim mismatch: "
+                f"expected D_u={self.updated_hypothesis_dim}, got D_u={hypothesis_update_history.shape[-1]}."
+            )
+        if not hypothesis_update_history.dtype.is_floating_point:
+            raise TypeError(
+                "hypothesis_update_history must be floating-point tensor, "
+                f"got dtype={hypothesis_update_history.dtype}."
+            )
+
+        flat_history = hypothesis_update_history.reshape(*hypothesis_update_history.shape[:-3], self.input_dim)
+        hidden = self.activation(self.linear_in(flat_history))
+        flat_outputs = self.linear_out(hidden)
+
+        if not self.tie_with_embedding:
+            return flat_outputs.reshape(*hypothesis_update_history.shape[:-3], self.num_next_chars, self.vocab_size)
+
+        if embedding_weight is None:
+            raise ValueError("embedding_weight must be provided when tie_with_embedding=True.")
+        if embedding_weight.ndim != 2:
+            raise ValueError(
+                f"embedding_weight must have shape [V, D_e], got shape={tuple(embedding_weight.shape)}."
+            )
+        if embedding_weight.shape[0] != self.vocab_size:
+            raise ValueError(
+                f"Embedding vocab mismatch: expected V={self.vocab_size}, got V={embedding_weight.shape[0]}."
+            )
+        if embedding_weight.shape[1] != self.tied_embedding_dim:
+            raise ValueError(
+                "Embedding dim mismatch for tied projection: "
+                f"expected D_e={self.tied_embedding_dim}, got D_e={embedding_weight.shape[1]}."
+            )
+        if not embedding_weight.dtype.is_floating_point:
+            raise TypeError(f"embedding_weight must be floating-point tensor, got dtype={embedding_weight.dtype}.")
+
+        token_features = flat_outputs.reshape(
+            *hypothesis_update_history.shape[:-3],
+            self.num_next_chars,
+            self.tied_embedding_dim,
+        )
+        return torch.einsum("...nd,vd->...nv", token_features, embedding_weight)
 
 
 class Matcher(nn.Module):
