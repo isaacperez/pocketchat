@@ -14,30 +14,164 @@ class Cortex(nn.Module):
         vocab_size: int,
         embedding_dim: int,
         padding_idx: int | None = None,
+        hidden_state_dim: int | None = None,
+        num_hypotheses: int = 4,
+        num_parts: int = 2,
+        window_size: int = 8,
+        num_iterations: int = 2,
+        hypothesis_dim: int | None = None,
+        observation_dim: int | None = None,
+        updated_hypothesis_dim: int | None = None,
+        matcher_eps: float = DEFAULT_MATCHER_EPS,
     ) -> None:
         super().__init__()
         if vocab_size <= 0:
             raise ValueError(f"vocab_size must be > 0, got {vocab_size}.")
         if embedding_dim <= 0:
             raise ValueError(f"embedding_dim must be > 0, got {embedding_dim}.")
+        if num_hypotheses <= 0:
+            raise ValueError(f"num_hypotheses must be > 0, got {num_hypotheses}.")
+        if num_parts <= 0:
+            raise ValueError(f"num_parts must be > 0, got {num_parts}.")
+        if window_size <= 0:
+            raise ValueError(f"window_size must be > 0, got {window_size}.")
+        if num_iterations <= 0:
+            raise ValueError(f"num_iterations must be > 0, got {num_iterations}.")
+        if matcher_eps <= 0:
+            raise ValueError(f"matcher_eps must be > 0, got {matcher_eps}.")
         if padding_idx is not None and not (0 <= padding_idx < vocab_size):
             raise ValueError(
                 f"padding_idx must be in [0, {vocab_size - 1}] when provided, got {padding_idx}."
             )
 
+        resolved_hidden_state_dim = embedding_dim if hidden_state_dim is None else hidden_state_dim
+        if resolved_hidden_state_dim <= 0:
+            raise ValueError(f"hidden_state_dim must be > 0, got {resolved_hidden_state_dim}.")
+
+        resolved_hypothesis_dim = resolved_hidden_state_dim if hypothesis_dim is None else hypothesis_dim
+        if resolved_hypothesis_dim <= 0:
+            raise ValueError(f"hypothesis_dim must be > 0, got {resolved_hypothesis_dim}.")
+
+        resolved_observation_dim = resolved_hypothesis_dim if observation_dim is None else observation_dim
+        if resolved_observation_dim <= 0:
+            raise ValueError(f"observation_dim must be > 0, got {resolved_observation_dim}.")
+
+        resolved_updated_hypothesis_dim = (
+            resolved_hypothesis_dim if updated_hypothesis_dim is None else updated_hypothesis_dim
+        )
+        if resolved_updated_hypothesis_dim <= 0:
+            raise ValueError(f"updated_hypothesis_dim must be > 0, got {resolved_updated_hypothesis_dim}.")
+
         self.vocab_size = vocab_size
         self.embedding_dim = embedding_dim
         self.padding_idx = padding_idx
+        self.hidden_state_dim = resolved_hidden_state_dim
+        self.num_hypotheses = num_hypotheses
+        self.num_parts = num_parts
+        self.window_size = window_size
+        self.num_iterations = num_iterations
+        self.hypothesis_dim = resolved_hypothesis_dim
+        self.observation_dim = resolved_observation_dim
+        self.updated_hypothesis_dim = resolved_updated_hypothesis_dim
         self.char_embeddings = nn.Embedding(
             num_embeddings=vocab_size,
             embedding_dim=embedding_dim,
             padding_idx=padding_idx,
         )
+        self.base_hidden_state = nn.Parameter(torch.zeros(resolved_hidden_state_dim))
+        self.hypothesis_generator = HypothesisGenerator(
+            hidden_state_dim=resolved_hidden_state_dim,
+            num_hypotheses=num_hypotheses,
+            hypothesis_dim=resolved_hypothesis_dim,
+        )
+        self.hypothesis_decomposer = HypothesisDecomposer(
+            hypothesis_dim=resolved_hypothesis_dim,
+            num_parts=num_parts,
+            matcher_dim=embedding_dim,
+        )
+        self.glimpse = Glimpse(window_size=window_size, squeeze_output=False, eps=matcher_eps)
+        self.matcher = Matcher(eps=matcher_eps)
+        self.hypothesis_observation_composer = HypothesisObservationComposer(
+            num_parts=num_parts,
+            window_size=window_size,
+            observation_dim=resolved_observation_dim,
+        )
+        self.hypothesis_updater = HypothesisUpdater(
+            hypothesis_dim=resolved_hypothesis_dim,
+            observation_dim=resolved_observation_dim,
+            updated_dim=resolved_updated_hypothesis_dim,
+        )
+        self.hidden_state_delta_predictor = HiddenStateDeltaPredictor(
+            num_hypotheses=num_hypotheses,
+            updated_hypothesis_dim=resolved_updated_hypothesis_dim,
+            hidden_state_dim=resolved_hidden_state_dim,
+        )
 
-    def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        token_ids: torch.Tensor,
+        lengths: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
         if token_ids.dtype.is_floating_point:
             raise TypeError(f"token_ids must be integer tensor, got dtype={token_ids.dtype}.")
-        return self.char_embeddings(token_ids.long())
+        was_unbatched = token_ids.ndim == 1
+        if was_unbatched:
+            token_ids = token_ids.unsqueeze(0)
+        if token_ids.ndim != 2:
+            raise ValueError(f"token_ids must have shape [L] or [B, L], got shape={tuple(token_ids.shape)}.")
+
+        token_ids = token_ids.long()
+        token_embeddings = self.char_embeddings(token_ids)
+        batch_size = token_ids.shape[0]
+        hidden_state = self.base_hidden_state.unsqueeze(0).expand(batch_size, -1)
+        base_hidden_state = hidden_state
+
+        updated_hypotheses_history: list[torch.Tensor] = []
+        hidden_state_deltas: list[torch.Tensor] = []
+
+        for _ in range(self.num_iterations):
+            hypotheses = self.hypothesis_generator(hidden_state)  # [B, H, D_h]
+            center_logits, zoom_logits, references, adapters = self.hypothesis_decomposer(hypotheses)  # [B,H,K], [B,H,K], [B,H,K,D], [B,H,K,D]
+
+            part_windows_flat = self.glimpse(
+                token_embeddings,
+                center_logits=center_logits.reshape(token_embeddings.shape[0], -1),
+                zoom_logits=zoom_logits.reshape(token_embeddings.shape[0], -1),
+                lengths=lengths,
+            )  # [B, H*K, W, D]
+            part_windows = part_windows_flat.reshape(
+                token_embeddings.shape[0],
+                self.num_hypotheses,
+                self.num_parts,
+                self.window_size,
+                self.embedding_dim,
+            )  # [B, H, K, W, D]
+
+            part_heatmaps = self.matcher(part_windows, references, adapters)  # [B, H, K, W]
+            observations = self.hypothesis_observation_composer(part_heatmaps)  # [B, H, D_o]
+            updated_hypotheses = self.hypothesis_updater(hypotheses, observations)  # [B, H, D_u]
+            hidden_state_delta = self.hidden_state_delta_predictor(updated_hypotheses)  # [B, D_hidden]
+
+            updated_hypotheses_history.append(updated_hypotheses)
+            hidden_state_deltas.append(hidden_state_delta)
+            hidden_state = hidden_state + hidden_state_delta
+
+        # [B, H, N, D_u] where N is the number of iterations and D_u is last.
+        hypothesis_update_history = torch.stack(updated_hypotheses_history, dim=2)
+        # [B, D_hidden, N]
+        hidden_state_delta_history = torch.stack(hidden_state_deltas, dim=-1)
+
+        outputs: dict[str, torch.Tensor] = {
+            "token_embeddings": token_embeddings,
+            "base_hidden_state": base_hidden_state,
+            "final_hidden_state": hidden_state,
+            "hidden_state_delta_history": hidden_state_delta_history,
+            "hypothesis_update_history": hypothesis_update_history,
+            "last_updated_hypotheses": updated_hypotheses_history[-1],
+        }
+        if was_unbatched:
+            outputs = {name: tensor.squeeze(0) for name, tensor in outputs.items()}
+        return outputs
 
 
 class HypothesisGenerator(nn.Module):
