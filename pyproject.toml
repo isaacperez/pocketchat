@@ -12,6 +12,7 @@ dependencies = [
   "pyyaml",
   "tqdm",
   "numpy>=2.2.6",
+  "matplotlib>=3.10.8",
 ]
 
 [dependency-groups]
